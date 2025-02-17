@@ -1,6 +1,8 @@
 module Main
 
+
 import Jebeerdy.Game
+
 
 %default total
 

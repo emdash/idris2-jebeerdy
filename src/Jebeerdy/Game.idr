@@ -1,240 +1,237 @@
 module Jebeerdy.Game
 
-
 import Data.List
 import Data.Vect
 import Data.SortedMap
 import Data.SortedSet
+import Jebeerdy.Board
+import Jebeerdy.Player
 import JSON.Derive
-
 
 %language ElabReflection
 %default total
 
 
-||| A Cell is an Answer and its question
+||| Games are configurable along these dimensions.
 |||
-||| For more complex game variations, we could expand on this type.
+||| It is used as a type parameter to to simplify dependent type
+||| signatures.
 |||
-||| Note that the answers are not stored in the cell. Cells are immutable.
+||| In other words, rather than have to pass `rows`, `cols`, `nplayers`
+||| as explicit type parameters, we can just pass `p`.
 public export
-record Cell where
-  constructor MkCell
-  clue : String
-  question : String
-%runElab derive "Cell" [Show, Eq, Ord, FromJSON, ToJSON]
+record Params where
+  rows : Nat
+  cols : Nat
+  nplayers : Nat
 
-||| A complete game board.
+||| Add CellID as an 'associated type' to `p`.
 |||
-||| This contains the cell grid, plus the column and value
-||| annotations. Like Cell, it is also read-only, plus the final
-||| round.
-export
-record Board (rows : Nat) (cols : Nat) where
-  constructor MkBoard
-  name       : String
-  categories : Vect cols String
-  values     : Vect rows Nat
-  cells      : Vect cols (Vect rows Cell)
-  final      : Cell
-%runElab deriveIndexed "Board" [Show, Eq, Ord, {- FromJSON,-} ToJSON]
+||| I.e. we can write `p.CellID`, rather than `CellID p.rows p.cols`.
+public export
+0 (.CellID) : Params -> Type
+(.CellID) p = CellID p.rows p.cols
 
-||| A player's name together with their score.
-export
-record Player where
-  constructor MkPlayer
-  name  : String
-  score : Integer
-%runElab derive "Player" [Show, Eq, Ord, FromJSON, ToJSON]
-
-||| Get a cell by row and column
-(.get) : Fin rows -> Fin cols -> Board rows cols -> Cell
--- Dependent types here make it impossible to confuse rows and cols here.
-(.get) i j self = index i $ index j self.cells
-
-||| An integer which represents a player.
+||| Add PlayerID as an 'associated type' to `p`.
 |||
-||| A player id is an integer from 0 to (1 - nplayers) of players,
-||| which in Idris is called `Fin`.
-0 PlayerID : (0 n : Nat) -> Type
-PlayerID n = Fin n
-
-||| A reference to a cell position
-0 CellID : (0 rows : Nat) -> (0 cols : Nat) -> Type
-CellID rows cols = (Fin rows, Fin cols)
-
-||| A set of players ranked in the order in which they hit the buzzer.
-0 PlayerQueue : Nat -> Type
-PlayerQueue np = SortedMap (PlayerID np) Nat
-
-||| Get the player who buzzed in first
-(.firstPlayer) : PlayerQueue np -> Maybe (PlayerID np)
-(.firstPlayer) buzzed = map fst $ head' $ sortBy buzzerTime $ toList buzzed
-  where
-    buzzerTime : (PlayerID np, Nat) -> (PlayerID np, Nat) -> Ordering
-    buzzerTime (p1, t1) (p2, t2) = compare t1 t2
-
-||| Remove the player who buzzed in first, making the next player the 'first'.
-(.next) : PlayerQueue np -> PlayerQueue np
-(.next) buzzed = case buzzed.firstPlayer of
-  Nothing => empty
-  Just p => delete p buzzed
-
-||| These are the actions which affect the game state.
-export
-data Action : (rows : Nat) -> (cols : Nat) -> (np : Nat) -> Type where
-  ChoosePlayer : PlayerID n -> Action rows cols n
-  ChooseCell   : CellID rows cols -> Action rows cols np
-  Advance      : Action rows cols np
-  BuzzIn       : PlayerID n -> Nat -> Action rows cols n
-  Score        : Bool -> Action rows cols np
+||| I.e. we can write `p.PlayerID`, rather than `PlayerID p.nplayers`.
+public export
+0 (.PlayerID) : Params -> Type
+(.PlayerID) p = PlayerID p.nplayers
 
 ||| The current state of play.
-data State : Nat -> Nat -> Nat -> Type where
-  AwaitPlayer   : State rows cols np
-  AwaitCell     : PlayerID np -> State rows cols np
-  ReadQuestion  : CellID rows cols -> State rows cols np
-  AwaitBuzzer   : PlayerQueue np -> CellID rows cols -> State rows cols np
-  AwaitScore    : PlayerQueue np -> CellID rows cols -> State rows cols np
-  Done          : State rows cols np
+data State
+  = AwaitPlayer
+  | AwaitCell
+  | ReadQuestion
+  | AwaitBuzzer
+  | AwaitScore
+  | Done
+
+||| Stores the current cell id and queue of buzzed-in players.
+record Buzzer (p : Params) where
+  constructor Buzz
+  players : PlayerQueue p.nplayers
+  cell    : p.CellID
+
+||| Type of the game's state-dependent field.
+0 StateData : State -> Params -> Type
+StateData AwaitPlayer  p = ()
+StateData AwaitCell    p = p.PlayerID
+StateData ReadQuestion p = p.CellID
+StateData AwaitBuzzer  p = Buzzer p
+StateData AwaitScore   p = Buzzer p
+StateData Done         p = p.PlayerID
 
 ||| The entire game state, information common to all game states.
 export
-record Game (rows : Nat) (cols : Nat) (np : Nat) where
+record Game (state : State) (p : Params) where
   constructor MkGame
-  board   : Board rows cols
-  players : Vect np Player
-  free    : SortedSet (CellID rows cols)
-  error   : Maybe String
-  state   : State rows cols np
+  board    : Board p.rows p.cols
+  players  : Vect p.nplayers Player
+  free     : SortedSet p.CellID
+  forState : StateData state p
 
 ||| The current player, if the game can be said to have one.
-(.playerID) : Game rows cols np -> Maybe (PlayerID np)
-(.playerID) game = case game.state of
-  AwaitPlayer            => Nothing
-  (AwaitCell id)         => Just id
-  (ReadQuestion _)       => Nothing
-  (AwaitBuzzer buzzed _) => buzzed.firstPlayer
-  (AwaitScore  buzzed _) => buzzed.firstPlayer
-  Done                   => Nothing
+(.playerID)
+  : {state : State}
+  -> Game state p
+  -> Maybe p.PlayerID
+(.playerID) self = case state of
+  AwaitPlayer  => Nothing
+  AwaitCell    => Just self.forState
+  ReadQuestion => Nothing
+  AwaitBuzzer  => self.forState.players.firstPlayer
+  AwaitScore   => self.forState.players.firstPlayer
+  Done         => Just self.forState
 
 ||| Get the current player's name, if it has one.
-(.player) : Game rows cols np -> Maybe Player
+(.player)
+  : {state : State}
+  -> Game state p
+  -> Maybe Player
 (.player) game = pure $ index !game.playerID game.players
 
 ||| Get the monetary value of the given cell
-(.cellValue) : Game rows cols np -> CellID rows cols -> Nat
-(.cellValue) self cell = index (fst cell) self.board.values
+(.cellValue) : Game state p -> p.CellID -> Nat
+(.cellValue) self cell = self.board.cellValue cell
 
 ||| Update the given player's score by the given amount
 (.adjustScore)
-  :  Game rows cols np
-  -> PlayerID np
-  -> Bool
-  -> CellID rows cols
-  -> Game rows cols np
-(.adjustScore) self id correct cell =
-  let value : Integer = cast $ self.cellValue cell
-  in case correct of
-    True  => {players $= updateAt id (updateScore value)} self
-    False => {players $= updateAt id (updateScore (-value))} self
-where
-  updateScore : Integer -> Player -> Player
-  updateScore value = {score $= (+ value)}
+  : {state : State}
+  -> Game state p
+  -> p.PlayerID
+  -> Integer
+  -> Game state p
+(.adjustScore) self id value = {
+  players $= updateAt id (updateScore value)
+} self
 
 ||| Mark the given cell as having been played.
 (.clearCell)
-  :  Game rows cols np
-  -> CellID rows cols
-  -> Game rows cols np
+  :  Game state p
+  -> p.CellID
+  -> Game state p
 (.clearCell) self cell = {free $= delete cell} self
 
 ||| True if all the cells have been cleared
-(.done) : Game rows cols np -> Bool
+(.done) : Game state p -> Bool
 (.done) self = self.free == empty
 
-||| Start the turn with the given player
-(.beginTurn) : Game rows cols np -> PlayerID np -> Game rows cols np
-(.beginTurn) self player = {state := AwaitCell player} self
+||| Start a turn with the given player.
+|||
+||| This will abruptly end the current turn.
+(.beginTurn)
+  :  Game state p
+  -> p.PlayerID
+  -> Game AwaitCell p
+(.beginTurn) self player = {forState := player} self
 
-||| Record the player's cell choice
-(.chooseCell) : Game rows cols np -> CellID rows cols -> Game rows cols np
-(.chooseCell) self cell = {state := ReadQuestion cell} self
+||| Record the player's cell choice.
+(.chooseCell)
+  :  Game AwaitCell p
+  -> p.CellID
+  -> Game ReadQuestion p
+(.chooseCell) self cell = ({forState := cell} self).clearCell cell
 
-||| Wait for the players to buzz in
-(.armBuzzers) : Game rows cols np -> CellID rows cols -> Game rows cols np
-(.armBuzzers) self cell = {state := AwaitBuzzer empty cell} self
-
-||| Clear the current cell, and reset the game state.
-(.endTurn)
-  :  Game rows cols np
-  -> CellID rows cols
-  -> Game rows cols np
-(.endTurn) self cell = {
-  free  $= delete cell,
-  state := AwaitPlayer
+||| Wait for the players to buzz in.
+|||
+||| This action is only valid in the ReadQuestion state.
+(.armBuzzers)
+  :  Game ReadQuestion p
+  -> Game AwaitBuzzer p
+(.armBuzzers) self = {
+  forState := Buzz {players = empty, cell = self.forState}
 } self
 
 ||| Record the player buzzing in at the given time.
+|||
+||| This action is only valid
 (.buzzIn)
-  :  Game rows cols np
-  -> PlayerQueue np
-  -> PlayerID np
+  :  Game AwaitBuzzer p
+  -> p.PlayerID
   -> Nat
-  -> CellID rows cols
-  -> Game rows cols np
-(.buzzIn) self pq player time cell = {
-  state := AwaitBuzzer (insert player time pq) cell
+  -> Game AwaitBuzzer p
+(.buzzIn) self player time = {
+  forState := {players $= insert player time} self.forState
 } self
 
-||| Advance to the next buzzed-in player.
-(.nextPlayer)
-  :  Game rows cols np
-  -> PlayerQueue np
-  -> CellID rows cols
-  -> Game rows cols np
-(.nextPlayer) self pq cell =
-  let pq = pq.next
-  in case (pq == empty) of
-    True => self.endTurn cell
-    False => {state := AwaitScore pq cell} self
+(.lockBuzzers) : Game AwaitBuzzer p -> Game AwaitScore p
+-- odd construction here is consequence of this being a dependent
+-- record.
+--
+-- XXX: is there an idiom for an empty record update?
+(.lockBuzzers) self = {forState := self.forState} self
 
-||| Helper function
+||| Clear the current cell, and reset the game state.
+|||
+||| This is a helper function, and always succeeds.
+(.endTurn)
+  :  Game _ p
+  -> Game AwaitPlayer p
+(.endTurn) self = {forState := ()} self
+
+||| Advance to the next player.
+(.nextPlayer) : Game AwaitScore p -> Game AwaitScore p
+(.nextPlayer) self = {
+  forState := {players $= (.next)} self.forState
+} self
+
+||| Adjust the current score for the player.
+|||
+||| If the player got the answer right, then increase their balance
+||| by the cell amount and start the next turn.
+|||
+||| If the player got the answer wrong, decrease the balance by the
+||| cell amount, and give the next player (if any) a chance to answer
+||| the question.
 (.scorePlayer)
-  :  Game rows cols np
-  -> PlayerQueue np
+  :  Game AwaitScore p
   -> Bool
-  -> CellID rows cols
-  -> Game rows cols np
-(.scorePlayer) self buzzed correct cell = case buzzed.firstPlayer of
-  Nothing => self.endTurn cell
-  Just p  => self.adjustScore p correct cell
+  -> Either (Game AwaitScore p) (Game AwaitPlayer p)
+(.scorePlayer) self correct = let
+  Buzz players cell = self.forState
+  value : Integer = cast $ self.cellValue cell
+  in case players.firstPlayer of
+    Nothing => Right $ self.endTurn
+    Just p  => case correct of
+      True => Right $ self.endTurn.adjustScore p value
+      False => Left $ (self.adjustScore p (-(cast value))).nextPlayer
 
-||| Helper function to set error messages
-(.error)
-  :  Game rows cols np
-  -> String
-  -> Game rows cols np
-(.error) self msg = {error := Just msg} self
-
-||| The transition function for the game's state machine.
+||| These are the actions which affect the game state.
 export
-transition
-  :  Game   rows cols np
-  -> Action rows cols np
-  -> Game   rows cols np
-transition game = go game.state
-  where
-    ||| Main table of transitions.
-    go
-      :  State rows cols np
-      -> Action rows cols np
-      -> Game rows cols np
-    go AwaitPlayer   (ChoosePlayer player) = game.beginTurn player
-    go (AwaitCell _) (ChooseCell cell)     = game.chooseCell cell
-    go (ReadQuestion   cell) Advance       = game.armBuzzers cell
-    go (AwaitBuzzer pq cell) (BuzzIn id t) = game.buzzIn pq id t cell
-    go (AwaitBuzzer pq cell) Advance       = {state := AwaitScore pq cell} game
-    go (AwaitScore  pq cell) (Score c)     = game.scorePlayer pq c cell
-    go Done _                              = game
-    go _           _                       = game.error "Invalid Action"
+data Action : (p : Params) -> Type where
+  ChoosePlayer : p.PlayerID -> Action p
+  ChooseCell   : p.CellID -> Action p
+  Advance      : Action p
+  BuzzIn       : p.PlayerID -> Nat -> Action p
+  Score        : Bool -> Action p
+
+||| Top-level game, with embedded state.
+record App p where
+  constructor A
+  state : State
+  game  : Game state p
+
+||| A helper function for defining the game state machine.
+continue
+  :  {state : State}
+  -> Game state p
+  -> Either String (App p)
+continue {state} game = Right $ A state game
+
+export
+handle
+  :  App p
+  -> Action p
+  -> Either String (App p)
+handle (A AwaitPlayer  g) (ChoosePlayer p) = continue $ g.beginTurn p
+handle (A AwaitCell    g) (ChooseCell   c) = continue $ g.chooseCell c
+handle (A ReadQuestion g) Advance          = continue $ g.armBuzzers
+handle (A AwaitBuzzer  g) (BuzzIn p t)     = continue $ g.buzzIn p t
+handle (A AwaitBuzzer  g) Advance          = continue $ g.lockBuzzers
+handle (A AwaitScore   g) (Score correct)  = case g.scorePlayer correct of
+  Left  nextPlayer => continue $ nextPlayer
+  Right endOfTurn  => continue $ endOfTurn
+handle (A Done         g) _ = Left "\{show $ name <$> g.player} wins"
+handle _                  _ = Left "Invalid Action"
